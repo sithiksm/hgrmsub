@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+
+__author__ = 'sithiksm'
+__version__ = '0.1'
+
+import argparse
+import subprocess
+import os
+import glob
+import time
+import re
+import sqlite3
+import io
+from pathlib import Path
+import re
+from shutil import copyfile
+import shlex
+
+
+tags_to_ignore = ['tip']
+
+class Converter:
+	def __init__(self, args):
+		self.branchpoints_map = {}			# Used for cross referencing hg->git revisions
+		self.rootdir = os.getcwd()
+		self.revision_map = {}
+		#Incase conversion fails inbetween, uncomment the below line and provide the revisionmap file name
+		#self.revision_map = eval(open("<revisionmapfilename>").read())
+		#print("Self revision map is %s" % self.revision_map)
+		self.closed_map = {}
+		self.dest = os.path.abspath(args.dest)
+		self.src = "%s/" % os.path.abspath(args.src)	# Trailing / to make rsync not to create a root directory
+		self.start_revision = args.revision
+		self.branches = ['default']
+		self.print_args()
+		self.check_src_repo()
+		self.check_dest_repo()
+		#Comment out the init_dest_repo if retriggering from failure point
+		self.init_dest_repo()
+		self.convert()
+
+	def print_args(self):
+		print("Source repo:     %s" % self.src)
+		print("Destination dir: %s" % self.dest)
+		print("Source revision: %s" % self.start_revision)
+
+	def check_src_repo(self):
+		print("Check src repo: ", end="", flush=True)
+		if not os.path.exists(self.src):
+			print("ERROR: Source directory '%s' doesn't exist" % self.src)
+			exit(1)
+		os.chdir(self.src)
+		if subprocess.call(['hg', 'status', self.src]):
+			exit(1)
+		print("OK")
+
+	def check_dest_repo(self):
+		print("Check dest repo: ", end="", flush=True)
+		if os.path.exists(self.dest):
+			print("INFO: Destination directory '%s' already exists" % self.dest)
+		print("OK")
+
+	def init_dest_repo(self):
+		print("Init dest repo: ", end="", flush=True)
+		if subprocess.call(['hg', 'init', self.dest]):
+			exit(1)
+		print("OK")
+
+	def branchpoints(self, branch):
+		os.chdir(self.src)
+		return subprocess.Popen(['hg', 'log', '-r', 'branchpoint() and branch(%s)' % (branch), '--template', '{node|short} '], stdout=subprocess.PIPE).stdout.readline().decode('UTF-8').split()
+
+	def convert(self):
+		print("Convert")
+		start = time.time()
+		nof_revisions = 0
+		for branch in self.branches:
+			branchpoints = self.branchpoints(branch)
+			revisions = self.src_branch_revisions(branch)
+			nof_revisions += len(revisions)
+			branch_parent = self.src_branch_parent(branch)
+		self.name_branches()
+
+		hg_revision_start = self.start_revision
+		hg_revision_end = self.hg_revision(self.src, 'tip')
+		print("HG REVISION START IS %s" % hg_revision_start)
+		print("HG REVISION END IS %s" % hg_revision_end)
+		for src_revision in range(hg_revision_start, hg_revision_end + 1):
+			# Update the source
+			os.chdir(self.src)
+			print("Revision: %i" % src_revision)
+			src_revision_str1 = str(src_revision)
+			src_revision_str = subprocess.Popen(['hg', 'log', '-r', '%s' % src_revision_str1, '--template', '{node|short}'], stdout=subprocess.PIPE).stdout.readline().decode('UTF-8').rstrip()
+
+			src_current_branch = subprocess.Popen(['hg', 'log', '-r', '%s' % src_revision_str, '--template', '{branch}'], stdout=subprocess.PIPE).stdout.readline().decode('UTF-8').rstrip()
+			print("SRC Current branch is %s" % src_current_branch)
+			ret = self.src_update(src_revision_str)
+			if ret == 255:
+				subprocess.Popen(['hg', 'update', '-C', '%s' % hg_revision_start])
+				continue
+			entries = self.src_log_entries(".")
+
+			# Find src parents
+			src_parents = self.hg_parents(self.src, src_revision_str).split(' ')
+			print("HG First Parent is %s" % src_parents)
+
+			# Find dest parent
+			parent_branch = self.hg_parent_branch(self.src, src_revision_str)
+
+			# Destination
+			# Checkout the corresponding parent node
+			if src_revision != 0:
+				# Find dest parent
+				dest_hgrev_parent = self.revision_map[src_parents[0]]
+				# Dest update
+				self.dest_update(dest_hgrev_parent)
+
+			# If the current hg revision is on another branch than the parent revision, create a branch in hg
+			if src_revision != 0:
+				if src_parents and parent_branch != entries['branch']:
+					self.create_branch(entries['branch'])
+
+			# If we have two parents
+			if len(src_parents) ==  2:
+				# 1. Find the second src parent
+				src_second = src_parents[1]
+				# 2. Find the corresponding destination parent
+				dest_second = self.revision_map[src_second]
+				# 3. Merge from destination parent
+				os.chdir(self.dest)
+				print("Executing hg merge")
+				proc = subprocess.Popen(['hg', 'merge', '-f', '--config', 'ui.interactive=no', '-r', dest_second])
+				try:
+    					outs, errs = proc.communicate(timeout=600)
+				except TimeoutExpired:
+    					proc.kill()
+    					outs, errs = proc.communicate()
+				ret = proc.returncode
+				if ret:
+					print("ERROR %i" % ret)
+					print(self.hg_command(self.dest, ['resolve', '-m', '.']))
+				subprocess.Popen(['hg', 'resolve', '-m', '.'], stdout=subprocess.PIPE)
+				#Remove orig files after merge
+				origfiles = [filex for filex in glob.glob('.' + '/**/*.orig', recursive=True)]
+				origfiles += [filex for filex in glob.glob('.' + '/**/.hgignore.orig', recursive=True)]
+				origfiles += [filex for filex in glob.glob('.' + '/**/.*.orig', recursive=True)]
+				for filex in origfiles:
+					os.unlink(filex)
+					print("Removing file %s" % filex)
+				print("Merge is completed")
+
+			if src_revision != 0:
+				dest_branch = self.dest_branch_check(dest_hgrev_parent)
+				# Check if src & dest are in same branch
+				if src_current_branch == dest_branch:
+					print("SRC & DEST branch are same")
+				else:
+					print("SRC & DEST are in different branch")
+					exit(1)
+
+			self.rsync()
+
+			if parent_branch in dict(self.closed_map):
+				print("SRC Revision in closed map is %s & %s" % (src_revision_str,self.closed_map[parent_branch]))
+				if src_revision_str == self.closed_map[parent_branch]:
+					print("closed branch rev is %s" % self.closed_map[parent_branch])
+					hgrev = self.hg_commit_closed(entries)
+				else:
+					hgrev = self.hg_commit(entries)
+			else:
+				hgrev = self.hg_commit(entries)
+
+			print("dest: HG REV ENTRIES: %s" % hgrev)
+			entries['hgrev'] = hgrev
+			print("%s = %s: %s" % (entries['node'], entries['hgrev'], io.StringIO(entries['desc']).readline().rstrip()))
+			self.revision_map[src_revision_str] = hgrev
+			print("*********** End of %s ***********\n" % src_revision)
+			f3 = open('%s/revisionmap' % self.rootdir, 'w')
+			f3.write("%s" % self.revision_map)
+			f3.close()
+
+		end = time.time()
+		elapsed = end - start
+		print("Converted %i revisions in %i seconds." % (hg_revision_end, elapsed))
+
+	def name_branches(self):
+		branch_name = re.compile('[\w,.,-]*')
+		branch_rev = re.compile(':\w*')
+		branch_closed = re.compile('(closed)')
+		b = self.hg_command(self.src, ['branches', '-c']).split('\n')
+		for line in b :
+			name = branch_name.search(line).group().strip('\s*')
+			rev = branch_rev.search(line).group().strip(':')
+			isclosed = branch_closed.search(line)
+			if isclosed:
+				self.closed_map[name] = rev
+
+	def hg_update(self, directory, rev):
+		cmd = ['-q', 'update', '-C', rev]
+		ret = self.hg_upd_command(directory, cmd)
+		return ret
+
+	def src_update(self, rev):
+		os.chdir(self.src)
+		ret = self.hg_update(self.src, rev)
+		self.hg_upd_command(self.src, ['purge'])
+		return ret
+
+	def dest_update(self, rev):
+		self.hg_update(self.dest, rev)
+		self.hg_upd_command(self.dest, ['purge'])
+
+	def dest_branch_check(self, rev):
+		os.chdir(self.dest)
+		return subprocess.Popen(['hg', 'branch'], stdout=subprocess.PIPE).stdout.readline().decode('UTF-8').rstrip()
+
+
+	def hg_command(self, path, cmd):
+		os.chdir(path)
+		print("hg_command: %s: hg %s" % (path, " ".join(cmd)))
+		proc = subprocess.Popen(['hg'] + cmd, stdout=subprocess.PIPE)
+		try:
+			outs, errs = proc.communicate(timeout=600)
+		except TimeoutExpired:
+			proc.kill()
+			outs, errs = proc.communicate()
+		ret = proc.returncode
+		if ret == 255:
+			print("ERROR in \'%s\'" % cmd)
+		output = outs.decode('latin-1').rstrip()
+		output = output.strip('"')
+		return output
+
+	def hg_upd_command(self, path, cmd):
+		os.chdir(path)
+		print("hg_command: %s: hg %s" % (path, " ".join(cmd)))
+		proc = subprocess.Popen(['hg'] + cmd, stdout=subprocess.PIPE)
+		try:
+			outs, errs = proc.communicate(timeout=600)
+		except TimeoutExpired:
+			proc.kill()
+			outs, errs = proc.communicate()
+		ret = proc.returncode
+		if ret == 255:
+			print("ERROR in \'%s\'" % cmd)
+		return ret
+
+	def hg_revision(self, path, name):
+		cmd = ['log', '-r', name, '--template', '{rev}']
+		return int(self.hg_command(path, cmd))
+
+	def hg_parents(self, path, rev):
+		cmd = ['parent', '-r', rev, '--template', '{node|short} ']
+		return self.hg_command(path, cmd)
+
+	def hg_parent_branch(self, path, rev):
+		cmd = ['parent', '-r', rev, '--template', '{branch} ']
+		st = self.hg_command(path, cmd).split()
+		if st:
+			return st[0]
+		else:
+			return ""
+
+	def src_branch_revisions(self, branch):
+		"""Return a list of revisions in a branch"""
+		os.chdir(self.src)
+		return subprocess.Popen(['hg', 'log', '-r', 'branch(%s) and ancestors(%s)' % (branch, branch), '--template', '{node|short} '], stdout=subprocess.PIPE).stdout.readline().decode('UTF-8').split()
+
+	def src_branch_parent(self, branch):
+		'''Find the parent revision of a branch'''
+		return subprocess.Popen(['hg', 'log', '-r', 'parents(min(branch(%s)))' % branch, '--template', '{node|short}'], stdout=subprocess.PIPE).stdout.readline().decode('UTF-8')
+
+	def src_current_revision(self, path):
+		rev = self.hg_command(path, ['id', '-i']).rstrip()
+		rev = rev.strip('+')
+		return rev
+
+	def src_log_entries(self, path):
+		os.chdir(path)
+		cmd = ['hg', 'log', '-r', '.', '--template', "{node|short},,,{desc},,,{desc|firstline},,,{author},,,{date|isodate},,,{tags},,,{file_dels},,,{file_adds},,,{parent},,,{parents},,,{branch}"]
+		log = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+		log_output = log.stdout.read().decode('latin-1').split(',,,')
+
+		# Put all log entries in a dictoinary
+		entries = {}
+		[entries['node'], entries['desc'], entries['descf'], entries['author'], entries['date'], entries['tags'], entries['file_dels'], entries['file_adds'], entries['parent'], entries['parents'], entries['branch']] = log_output
+		return entries
+
+	def src_log_entry(self, path, template):
+		print("path: %s, %s" % (path, self.src_current_revision(path)))
+		cmd = ['log', '-r', self.src_current_revision(path), '--template', template]
+		log = self.hg_command(path, cmd)
+		return log
+
+	def create_branch(self, branch):
+		print("Create branch: %s" % branch)
+		os.chdir(self.dest)
+		subprocess.call(['hg', 'branch', '-f', branch], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+	def hg_commit(self, entries):
+		'''Commit and tag revision'''
+		os.chdir(self.dest)
+		ignored_files = []
+		self.hg_command(self.dest, ['addremove', '.'])
+		ignored_files = self.hg_command(self.dest, ['status', '-i', '-n']).split('\n')
+		if ignored_files:
+			for ig_file in ignored_files:
+				self.hg_command(self.dest, ['add', '%s' % ig_file])
+		F = open('%s/../.commitmessage' % self.dest,"w")
+		F.write(entries['desc'])
+		F.close()
+
+		if entries['tags']:
+			self.hg_command(self.dest, ['commit', '-m', "'%s'" % entries['descf'], '--user=%s' % entries['author'], '--date=%s' % entries['date']])
+		else:
+			self.hg_command(self.dest, ['commit', '-l', '%s/../.commitmessage' % self.dest, '--user=%s' % entries['author'], '--date=%s' % entries['date']])
+
+
+		# Tags
+		for tag in entries['tags'].split():
+			if not tag in tags_to_ignore:
+				self.hg_command(self.dest, ['tag', tag, '-m', "'%s'" % entries['descf'], '--user=%s' % entries['author'], '--date=%s' % entries['date']])
+
+		newrev = subprocess.Popen(['hg', 'id', '-i'], stdout=subprocess.PIPE).stdout.readline().decode('UTF-8').rstrip()
+		print("REV: '%s'" % newrev)
+		return newrev
+
+	def hg_commit_closed(self, entries):
+		'''Commit and tag revision'''
+		os.chdir(self.dest)
+		self.hg_command(self.dest, ['addremove', '.'])
+		ignored_files = self.hg_command(self.dest, ['status', '-i', '-n']).split('\n')
+		if ignored_files:
+			for ig_file in ignored_files:
+				self.hg_command(self.dest, ['add', '%s' % ig_file])
+		subprocess.call(['hg', 'commit', '--close-branch', '-m', entries['descf'], '--user=%s' % entries['author'], '--date=%s' % entries['date'], '-X', '*.orig'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+		rev = subprocess.Popen(['hg', 'id', '-i'], stdout=subprocess.PIPE).stdout.readline().decode('UTF-8').rstrip()
+		print("REV: '%s'" % rev)
+		return rev
+
+	def rsync(self):
+		print("Rsync")
+		'''Use rsync to copy everything from the source repository to the destination repository'''
+		returncode = subprocess.call(["rsync", "-qav", self.src, self.dest, "--delete", "--include", ".hgignore", "--exclude", ".hg/*", "--exclude", "self.src/**/*.orig", "--exclude", ".hgsub*", "--exclude", "**/.hg*", "--exclude", "**/.*.orig"])
+
+
+def check_requirement(requirement):
+	return_value = True
+
+	try:
+		rsync = subprocess.call([requirement] + ['--version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+	except OSError:
+		missing_requirement(requirement)
+		return_value = False
+	return return_value
+
+def check_requirements():
+	"""Check for requirements"""
+	requirments_ok = True
+
+	if not (check_requirement("rsync") and check_requirement("hg")):
+		print("Exiting!")
+		exit(1)
+
+def missing_requirement(application):
+	print("ERROR: Required application '%s' is missing in the PATH." % application)
+
+
+def parse_arguments():
+	parser = argparse.ArgumentParser(description='Convert a mercurial repository including subrepos to a monolithic mercurial repository.', epilog = 'version: %s, author: %s' % (__version__, __author__))
+	parser.add_argument('-s', '--src', action='store', help='source repository', required = True)
+	parser.add_argument('-d', '--dest', action='store', help='destination repository', required = True)
+	parser.add_argument('-sr', '--revision', action='store', help='Mercurial start revision')
+	return  parser.parse_args()
+
+if __name__ == "__main__":
+	args = parse_arguments()
+	check_requirements()
+	converter = Converter(args)
+
